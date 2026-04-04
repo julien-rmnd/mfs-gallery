@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8"/>
+<title>Re-migration images → Cloudinary</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#080709;color:#f2ede6;font-family:'Courier New',monospace;font-size:.85rem;padding:2rem;min-height:100vh}
+h1{font-size:1.1rem;color:#d4ae78;margin-bottom:.3rem;letter-spacing:.1em}
+.sub{color:rgba(242,237,230,.4);font-size:.7rem;margin-bottom:2rem}
+.card{background:#141318;border:1px solid rgba(242,237,230,.08);padding:1.5rem;margin-bottom:1rem;max-width:720px}
+.card h2{font-size:.7rem;letter-spacing:.2em;text-transform:uppercase;color:#b8965a;margin-bottom:.8rem}
+button{padding:.6rem 1.8rem;background:#b8965a;color:#080709;border:none;font-family:inherit;font-size:.7rem;letter-spacing:.2em;text-transform:uppercase;cursor:pointer;transition:opacity .2s;margin-top:.5rem}
+button:hover{opacity:.8}
+button:disabled{opacity:.35;cursor:not-allowed}
+#log{background:#0e0d10;border:1px solid rgba(242,237,230,.06);padding:1rem;max-height:400px;overflow-y:auto;font-size:.72rem;line-height:1.9;max-width:720px;margin-top:1rem;display:none}
+.ok{color:#7ec87e}.err{color:#e07070}.info{color:#d4ae78}.dim{color:rgba(242,237,230,.4)}
+#result{display:none;background:#141318;border:1px solid rgba(184,150,90,.3);padding:1.5rem;max-width:720px;margin-top:1rem}
+#result h2{color:#d4ae78;font-size:.75rem;letter-spacing:.2em;text-transform:uppercase;margin-bottom:.8rem}
+#result p{font-size:.78rem;line-height:1.9;color:rgba(242,237,230,.7)}
+#result strong{color:#f2ede6}
+.progress-bar-wrap{background:#0e0d10;height:2px;width:100%;max-width:720px;margin-top:.8rem;display:none}
+#progressBar{height:2px;background:#b8965a;width:0%;transition:width .2s}
+#progressLabel{font-size:.62rem;color:rgba(242,237,230,.35);margin-top:.3rem;letter-spacing:.1em}
+</style>
+</head>
+<body>
+<h1>Re-migration images Supabase → Cloudinary</h1>
+<p class="sub">Récupère chaque image depuis Supabase Storage, la réupload sur Cloudinary, et met à jour le photos.json sur GitHub</p>
+
+<div class="card">
+  <h2>Paramètres (pré-remplis)</h2>
+  <div style="display:grid;gap:.5rem;font-size:.72rem;color:rgba(242,237,230,.5)">
+    <div>Cloudinary : <span style="color:#d4ae78">dwx4lys2o</span> · preset <span style="color:#d4ae78">dernier site</span></div>
+    <div>GitHub : <span style="color:#d4ae78">julien-rmnd/mfs-gallery</span> · data/photos.json</div>
+  </div>
+</div>
+
+<button id="btn" onclick="run()">🚀 Lancer la re-migration</button>
+<div class="progress-bar-wrap" id="progressWrap"><div id="progressBar"></div></div>
+<div id="progressLabel"></div>
+<div id="log"></div>
+<div id="result"></div>
+
+<script>
+const CL_CLOUD='dwx4lys2o';
+const CL_PRESET='dernier site';
+const GH_TOKEN='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';
+const GH_REPO='julien-rmnd/mfs-gallery';
+const GH_BRANCH='main';
+const GH_PHOTOS='data/photos.json';
+
+function log(msg,cls='dim'){
+  const d=document.getElementById('log');
+  d.style.display='block';
+  d.innerHTML+=`<div class="${cls}">${msg}</div>`;
+  d.scrollTop=d.scrollHeight;
+}
+
+function setProgress(done,total){
+  document.getElementById('progressWrap').style.display='block';
+  document.getElementById('progressBar').style.width=Math.round(done/total*100)+'%';
+  document.getElementById('progressLabel').textContent=`${done} / ${total} images traitées`;
+}
+
+async function ghGetFile(path){
+  const r=await fetch(`https://api.github.com/repos/${GH_REPO}/contents/${path}?ref=${GH_BRANCH}&t=${Date.now()}`,{
+    headers:{'Authorization':'token '+GH_TOKEN,'Accept':'application/vnd.github+json'}
+  });
+  if(!r.ok)throw new Error(`GitHub GET failed: ${r.status}`);
+  const d=await r.json();
+  return{content:JSON.parse(atob(d.content.replace(/\n/g,''))),sha:d.sha};
+}
+
+async function ghPutFile(path,content,sha){
+  const body={
+    message:`remigrate: update ${path}`,
+    content:btoa(unescape(encodeURIComponent(JSON.stringify(content,null,2)))),
+    branch:GH_BRANCH,sha
+  };
+  const r=await fetch(`https://api.github.com/repos/${GH_REPO}/contents/${path}`,{
+    method:'PUT',
+    headers:{'Authorization':'token '+GH_TOKEN,'Content-Type':'application/json','Accept':'application/vnd.github+json'},
+    body:JSON.stringify(body)
+  });
+  if(!r.ok){const e=await r.text();throw new Error(`GitHub PUT failed: ${r.status} — ${e}`);}
+}
+
+async function clUploadFromUrl(imageUrl, publicId){
+  // Upload vers Cloudinary via URL (fetch_upload)
+  const fd=new FormData();
+  fd.append('file', imageUrl);
+  fd.append('upload_preset', CL_PRESET);
+  fd.append('folder','galerie');
+  const r=await fetch(`https://api.cloudinary.com/v1_1/${CL_CLOUD}/image/upload`,{method:'POST',body:fd});
+  if(!r.ok){
+    const e=await r.text();
+    throw new Error(`Cloudinary upload failed: ${r.status} — ${e}`);
+  }
+  const d=await r.json();
+  return{url:d.secure_url, publicId:d.public_id};
+}
+
+async function run(){
+  const btn=document.getElementById('btn');
+  btn.disabled=true;
+  document.getElementById('log').innerHTML='';
+  document.getElementById('result').style.display='none';
+
+  try{
+    // 1. Charger le JSON depuis GitHub
+    log('📂 Chargement du photos.json depuis GitHub…','info');
+    const {content:photos, sha}=await ghGetFile(GH_PHOTOS);
+    log(`✅ ${photos.length} entrées chargées`,'ok');
+
+    // 2. Filtrer celles qui ont encore une URL Supabase
+    const toMigrate=photos.filter(p=>p.url&&p.url.includes('supabase.co'));
+    const already=photos.filter(p=>!p.url||!p.url.includes('supabase.co'));
+    log(`📊 ${already.length} déjà sur Cloudinary · ${toMigrate.length} à migrer`,'info');
+
+    if(toMigrate.length===0){
+      log('✅ Toutes les images sont déjà sur Cloudinary !','ok');
+      btn.disabled=false;
+      return;
+    }
+
+    // 3. Re-uploader chaque image Supabase vers Cloudinary
+    let done=0, errors=0;
+    const updatedPhotos=[...photos]; // copie complète
+
+    for(const photo of toMigrate){
+      try{
+        log(`⬆️ [${done+errors+1}/${toMigrate.length}] ${photo.name||photo.id}…`);
+        const {url:newUrl, publicId}=await clUploadFromUrl(photo.url);
+        // Mettre à jour dans le tableau
+        const idx=updatedPhotos.findIndex(p=>p.id===photo.id);
+        if(idx>-1){
+          updatedPhotos[idx]={...updatedPhotos[idx], url:newUrl, path:publicId};
+        }
+        done++;
+        log(`  ✅ OK → ${newUrl.slice(0,60)}…`,'ok');
+      }catch(e){
+        errors++;
+        log(`  ❌ Erreur pour "${photo.name||photo.id}": ${e.message}`,'err');
+      }
+      setProgress(done+errors, toMigrate.length);
+
+      // Sauvegarder sur GitHub tous les 10 pour éviter de tout perdre en cas d'erreur
+      if((done+errors)%10===0 && done>0){
+        try{
+          log(`💾 Sauvegarde intermédiaire (${done} faites)…`,'info');
+          const fresh=await ghGetFile(GH_PHOTOS);
+          await ghPutFile(GH_PHOTOS, updatedPhotos, fresh.sha);
+          log('  ✅ Sauvegarde intermédiaire OK','ok');
+        }catch(e){
+          log(`  ⚠️ Sauvegarde intermédiaire échouée: ${e.message}`,'err');
+        }
+      }
+    }
+
+    // 4. Sauvegarde finale
+    log('💾 Sauvegarde finale sur GitHub…','info');
+    const fresh=await ghGetFile(GH_PHOTOS);
+    await ghPutFile(GH_PHOTOS, updatedPhotos, fresh.sha);
+    log('✅ photos.json mis à jour sur GitHub','ok');
+
+    // Résultat
+    const res=document.getElementById('result');
+    res.style.display='block';
+    res.innerHTML=`
+      <h2>✅ Re-migration terminée</h2>
+      <p>
+        <strong>${done}</strong> images migrées vers Cloudinary<br>
+        ${errors>0?`<strong style="color:#e07070">${errors}</strong> erreurs (images probablement supprimées de Supabase)<br>`:''}
+        <br>
+        Tu peux maintenant recharger ton site Netlify — toutes les images seront servies depuis Cloudinary. 🚀
+      </p>
+    `;
+    log('🎉 Terminé !','ok');
+
+  }catch(e){
+    log(`❌ Erreur fatale: ${e.message}`,'err');
+    console.error(e);
+  }
+
+  btn.disabled=false;
+}
+</script>
+</body>
+</html>
